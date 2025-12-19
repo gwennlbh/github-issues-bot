@@ -1,75 +1,168 @@
-import DiscordJS from "discord.js"
+import * as DiscordJS from "discord.js"
 import dotenv from "dotenv"
-import { Octokit } from "@octokit/rest"
-import { getModal } from "./utils"
+import { App } from "octokit"
+import { getModal } from "./utils.js"
+import arkenv from "arkenv"
 import express from "express"
+import { regex } from "arktype"
 dotenv.config()
 
-const app = express()
-const PORT = process.env.PORT || 3000
-
-app.use(express.json())
-
-app.get("/", (req, res) => {
-  res.send("Github issues bot!")
+const env = arkenv({
+  "PORT?": "number.port",
+  GITHUB_APP_ID: "string > 0",
+  GITHUB_APP_INSTALLATION_ID: "string.integer.parse",
+  GITHUB_USERNAME: "string > 0",
+  BOT_TOKEN: "string > 0",
+  GUILD_ID: "string.integer > 0",
+  GITHUB_REPOSITORY: [
+    regex("^(?<owner>[^/]+)/(?<repo>[^/]+)$"),
+    "=>",
+    (repoAndOwner) => {
+      const [owner, repo] = repoAndOwner.split("/", 2)
+      return { owner, repo }
+    },
+  ],
 })
 
-app.listen(PORT, () => {
-  console.log(`Server is listening on port ${PORT}`)
+// const app = express()
+
+// app.use(express.json())
+
+// app.get("/", (_, res) => {
+//   res.send("Github issues bot!")
+// })
+
+// app.listen(env.PORT ?? 3000, () => {
+//   console.log(`Server is listening on port ${env.PORT ?? 3000}`)
+// })
+
+const reporter = new App({
+  appId: env.GITHUB_APP_ID,
+  privateKey: await Bun.file("./github-app-key.pem").text(),
+  log: console,
 })
+
+const gh = await reporter.getInstallationOctokit(env.GITHUB_APP_INSTALLATION_ID)
+
+const { owner, repo } = env.GITHUB_REPOSITORY
+
+const { data: repository } = await gh.rest.repos.get({ owner, repo })
+console.info(`Acting on ${repository.full_name}`)
 
 const client = new DiscordJS.Client({
   intents: ["Guilds", "GuildMessages"],
 })
 
-client.on("ready", () => {
-  console.log("issue bot ready")
+client.on("clientReady", async () => {
+  console.log("Bot is ready.")
   const guildId = process.env.GUILD_ID || ""
 
   const guild = client.guilds.cache.get(guildId)
-
-  let commands:
-    | DiscordJS.GuildApplicationCommandManager
-    | DiscordJS.ApplicationCommandManager
-    | undefined
-
-  if (guild) {
-    commands = guild.commands
-  } else {
-    commands = client.application?.commands
+  if (!guild) {
+    throw new Error("Guild not found")
   }
 
-  commands?.create({
-    name: "Open github issue",
+  const commands = guild.commands
+
+  for (const [, cmd] of await commands.fetch()) {
+    await commands.delete(cmd.id)
+  }
+
+  await commands.create({
+    name: "To Github Bug",
+    type: 3,
+  })
+
+  await commands.create({
+    name: "To Github Feature Request",
+    type: 3,
+  })
+
+  await commands.create({
+    name: "To Github Task",
     type: 3,
   })
 })
 
 client.on("interactionCreate", async (interaction) => {
   if (interaction.isMessageContextMenuCommand()) {
-    const { commandName, targetMessage } = interaction
-    if (commandName === "Open github issue") {
-      const modal = getModal(targetMessage)
+    const { commandName, targetMessage, user } = interaction
+    console.log(`Received command ${commandName} from ${user.tag}`)
+    const githubIssueCommand =
+      /^To Github (?<type>Bug|Feature Request|Task)$/.exec(commandName)
+    if (githubIssueCommand) {
+      const { data: labels } = await gh.rest.issues
+        .listLabelsForRepo({ owner, repo })
+        .catch(() => ({ data: [] }))
+
+      const { data: issueTypes } = await gh
+        .request("GET /orgs/{org}/issue-types", { org: owner })
+        .catch(() => ({ data: [] }))
+
+      const { data: milestones } = await gh.rest.issues
+        .listMilestones({ owner, repo })
+        .catch(() => ({ data: [] }))
+
+      const { data: collaborators } = await gh.rest.repos
+        .listCollaborators({ owner, repo })
+        .catch(() => ({ data: [] }))
+
+      const modal = getModal({
+        id: `create github issue ${githubIssueCommand.groups?.type}`,
+        user,
+        message: targetMessage,
+        labels,
+        issueTypes,
+        milestones,
+        collaborators,
+      })
       interaction.showModal(modal)
     }
   } else if (interaction.isModalSubmit()) {
-    const { fields } = interaction
-    const title = fields.getTextInputValue("issueTitle")
-    const body = fields.getTextInputValue("issueDescription")
-    const octokit = new Octokit({
-      auth: process.env.GITHUB_ACCESS_TOKEN,
-      baseUrl: "https://api.github.com",
+    const { fields, customId } = interaction
+    console.log(
+      `Received modal submit ${interaction.customId} from ${interaction.user.tag}`
+    )
+    const title = fields.getTextInputValue("title")
+    const body = fields.getTextInputValue("desc")
+    const labels = fields.fields.has("labels")
+      ? fields.getStringSelectValues("labels")
+      : []
+    const [milestone] = fields.fields.has("milestone")
+      ? fields.getStringSelectValues("milestone")
+      : []
+    const [assignee] = fields.fields.has("assignee")
+      ? fields.getStringSelectValues("assignee")
+      : []
+
+    const type = {
+      Task: "Task",
+      Bug: "Bug",
+      "Feature Request": "Feature",
+      // "Dependencies",
+    }[customId.replace("create github issue ", "")]
+
+    console.log(`Creating issue with`, {
+      title,
+      body,
+      labels,
+      milestone,
+      assignee,
+      type,
     })
 
-    let [owner, repo] = (process.env.GITHUB_REPOSITORY || "").split("/", 2)
-    if (!repo) {
-      repo = owner
-      owner = process.env.GITHUB_USERNAME || ""
-    }
-
-    octokit.rest.issues.create({ owner, repo, title, body }).then((res) => {
-      interaction.reply(`Issue created: ${res.data.html_url}`)
+    const { data: issue } = await gh.rest.issues.create({
+      owner,
+      repo,
+      title,
+      body,
+      milestone,
+      assignee,
+      labels: [...labels],
+      type,
     })
+
+    await interaction.reply(`[Created #${issue.number}](${issue.html_url})`)
   }
 })
 
