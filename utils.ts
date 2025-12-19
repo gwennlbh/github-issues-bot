@@ -1,3 +1,4 @@
+import DiscordJS from "discord.js"
 import {
     ActionRowBuilder,
     ModalBuilder,
@@ -5,7 +6,7 @@ import {
     TextInputStyle,
 } from "discord.js";
 
-export const getModal = (description: string) => {
+export const getModal = (message: DiscordJS.Message<boolean>) => {
     const modal = new ModalBuilder()
         .setTitle("Create github issue")
         .setCustomId("AwesomeForm");
@@ -19,7 +20,7 @@ export const getModal = (description: string) => {
         .setStyle(TextInputStyle.Paragraph)
         .setCustomId("issueDescription")
         .setLabel("Issue description")
-        .setValue(description);
+        .setValue(`${message}\n\n---\n_Issue created by ${message.author.tag} [via Discord](${message.url})_`);
 
     const rows = [issueTitle, issueDescription].map((component) =>
         new ActionRowBuilder<TextInputBuilder>().addComponents([component])
